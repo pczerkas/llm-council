@@ -1,0 +1,61 @@
+# .epic-loop/config.yaml — per-repo bindings for /epic-loop and /adr-epic.
+# Schema: .claude/skills/epic-loop/references/config-schema.md
+# Tuned for llm-council (Python package: CLI + HTTP + MCP server).
+version: 1
+
+project:
+  name: "llm-council"
+  short_name: "council"
+  repo: "amiable-dev/llm-council"        # EPIC=N resolves against this repo
+
+# Pre-push gates mirror the ACTUAL blocking CI checks so a red CI (state F) is
+# caught locally first. Note: CI's type-check step is advisory
+# (`mypy … || echo "…non-blocking"`) and the repo carries pre-existing mypy
+# debt, so `make check` would wrongly block the loop on baseline errors CI
+# tolerates. We gate on ruff (the blocking Lint job) + tests; mypy stays a
+# manual due-diligence check on changed code. Scoped via only_if_changed so
+# docs/ADR-only PRs skip build/test and pay nothing. `make test-fast` keeps the
+# loop snappy; CI runs the full `make test` suite as the backstop.
+pre_push_gates:
+  - name: lint
+    command: make lint           # ruff check src/ tests/ — the blocking CI gate
+    only_if_changed:
+      - "src/**"
+      - "tests/**"
+      - "pyproject.toml"
+  - name: tests-fast
+    command: make test-fast
+    only_if_changed:
+      - "src/**"
+      - "tests/**"
+
+language_test_guards: []
+gui_paths: []
+
+# slop-detector (already installed, pinned) runs collect-only over src/ and is
+# fed to Council as informational evidence — not a hard gate.
+quality_signals:
+  enabled: true
+  scan_target: "src"
+  trigger_paths:
+    - "src/**"
+  scanner_version_pin: "3.7.3"
+
+council:
+  default_tier: balanced
+  confidence_threshold: 0.7
+  on_budget_exceeded: manual_coverage
+
+# No Copilot reviewer authors PRs in this repo → skip the B0–B3 ladder and go
+# straight to the mandatory Council gate. Flip to `copilot` if that changes.
+review: none
+
+# Raised to 5/hr (from 2) for autonomous multi-phase execution of epic #359.
+# Safe here because child merges never publish: setuptools-scm derives the
+# version from git tags and publish.yml triggers on tag push only, so merging
+# phase PRs to master does NOT release. Versioning is deferred to ONE release
+# at epic completion (minor, or major if breaking), per the impact of the whole
+# epic — see epic #359 and [[council-release-once-per-epic]].
+cadence_floor:
+  max_merges_per_hour: 5
+  scope: closes_clause

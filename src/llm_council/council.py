@@ -262,6 +262,83 @@ MODEL_STATUS_AUTH_ERROR = STATUS_AUTH_ERROR
 ProgressCallback = Callable[[int, int, str], Awaitable[None]]
 
 
+def _add_cost_to_usage(
+    total_usage: Dict[str, Any], usage: Dict[str, Any], model: Optional[str] = None
+) -> None:
+    """ADR-011: accumulate cost_usd, cached_tokens, and optional per-model spend.
+
+    Additive to the existing token aggregation. ``usage["cost"]`` may be None
+    (provider didn't report it) and is treated as a 0 contribution. When
+    ``model`` is given, the same figures also accumulate under
+    ``total_usage["by_model"][model]`` (reviewer-primary attribution).
+    """
+    raw_cost = usage.get("cost")
+    cost = raw_cost or 0.0
+    cached = usage.get("cached_tokens", 0) or 0
+    total_usage["cost_usd"] = total_usage.get("cost_usd", 0.0) + cost
+    total_usage["cached_tokens"] = total_usage.get("cached_tokens", 0) + cached
+    # Track whether ANY cost was reported so the summary can tell a genuine
+    # $0 (free/local) from unknown cost (None) — a present cost, even 0.0, is
+    # "known".
+    if raw_cost is not None:
+        total_usage["cost_known"] = True
+    if model is not None:
+        bucket = total_usage.setdefault("by_model", {}).setdefault(
+            model,
+            {
+                "prompt_tokens": 0,
+                "completion_tokens": 0,
+                "total_tokens": 0,
+                "cost_usd": 0.0,
+                "cached_tokens": 0,
+            },
+        )
+        bucket["prompt_tokens"] += usage.get("prompt_tokens", 0)
+        bucket["completion_tokens"] += usage.get("completion_tokens", 0)
+        bucket["total_tokens"] += usage.get("total_tokens", 0)
+        bucket["cost_usd"] += cost
+        bucket["cached_tokens"] += cached
+        if raw_cost is not None:
+            bucket["cost_known"] = True
+
+
+def _build_usage_summary(by_stage: Dict[str, Dict[str, Any]]) -> Dict[str, Any]:
+    """ADR-011: assemble the ``metadata["usage"]`` block from per-stage buckets.
+
+    Produces ``{"by_stage", "by_model", "total"}`` where ``total`` sums tokens +
+    cost + cached across stages and ``by_model`` merges per-model spend. Shared
+    by both council entry points so the HTTP and MCP paths report identically.
+    """
+    grand_total = {
+        "prompt_tokens": sum(s.get("prompt_tokens", 0) for s in by_stage.values()),
+        "completion_tokens": sum(s.get("completion_tokens", 0) for s in by_stage.values()),
+        "total_tokens": sum(s.get("total_tokens", 0) for s in by_stage.values()),
+        "cost_usd": sum(s.get("cost_usd", 0.0) for s in by_stage.values()),
+        "cached_tokens": sum(s.get("cached_tokens", 0) for s in by_stage.values()),
+        "cost_known": any(s.get("cost_known", False) for s in by_stage.values()),
+    }
+    numeric_keys = ("prompt_tokens", "completion_tokens", "total_tokens", "cost_usd", "cached_tokens")
+    by_model: Dict[str, Dict[str, Any]] = {}
+    for stage_usage in by_stage.values():
+        for model_id, model_usage in stage_usage.get("by_model", {}).items():
+            agg = by_model.setdefault(
+                model_id,
+                {
+                    "prompt_tokens": 0,
+                    "completion_tokens": 0,
+                    "total_tokens": 0,
+                    "cost_usd": 0.0,
+                    "cached_tokens": 0,
+                    "cost_known": False,
+                },
+            )
+            for key in numeric_keys:  # never iterate the bool cost_known
+                agg[key] += model_usage.get(key, 0)
+            if model_usage.get("cost_known"):
+                agg["cost_known"] = True
+    return {"by_stage": by_stage, "by_model": by_model, "total": grand_total}
+
+
 async def stage1_collect_responses(user_query: str) -> Tuple[List[Dict[str, Any]], Dict[str, int]]:
     """
     Stage 1: Collect individual responses from all council models.
@@ -289,6 +366,7 @@ async def stage1_collect_responses(user_query: str) -> Tuple[List[Dict[str, Any]
             total_usage["prompt_tokens"] += usage.get("prompt_tokens", 0)
             total_usage["completion_tokens"] += usage.get("completion_tokens", 0)
             total_usage["total_tokens"] += usage.get("total_tokens", 0)
+            _add_cost_to_usage(total_usage, usage, model=model)
 
     return stage1_results, total_usage
 
@@ -364,6 +442,7 @@ async def stage1_collect_responses_with_status(
             total_usage["prompt_tokens"] += usage.get("prompt_tokens", 0)
             total_usage["completion_tokens"] += usage.get("completion_tokens", 0)
             total_usage["total_tokens"] += usage.get("total_tokens", 0)
+            _add_cost_to_usage(total_usage, usage, model=model)
 
     return stage1_results, total_usage, model_statuses
 
@@ -762,6 +841,18 @@ async def run_council_with_fallback(
         result["metadata"]["effective_verdict_type"] = effective_verdict_type.value
         result["metadata"]["deadlock_detected"] = deadlock_detected
 
+        # ADR-011: aggregate usage into metadata so the MCP path reports cost +
+        # tokens (previously absent on this fallback path — parity with
+        # run_full_council).
+        result["metadata"]["usage"] = _build_usage_summary(
+            {
+                "stage1": stage1_usage,
+                "stage1_5": stage1_5_usage,
+                "stage2": stage2_usage,
+                "stage3": stage3_usage,
+            }
+        )
+
         # ADR-025b: Add verdict result for BINARY/TIE_BREAKER modes
         if verdict_result is not None:
             result["metadata"]["verdict"] = verdict_result.to_dict()
@@ -1074,6 +1165,7 @@ Rewritten text:"""
             total_usage["prompt_tokens"] += usage.get("prompt_tokens", 0)
             total_usage["completion_tokens"] += usage.get("completion_tokens", 0)
             total_usage["total_tokens"] += usage.get("total_tokens", 0)
+            _add_cost_to_usage(total_usage, usage, model=result["model"])
         else:
             # If normalization fails, use original
             normalized_results.append(
@@ -1359,6 +1451,7 @@ Now provide your evaluation and ranking:"""
             total_usage["prompt_tokens"] += usage.get("prompt_tokens", 0)
             total_usage["completion_tokens"] += usage.get("completion_tokens", 0)
             total_usage["total_tokens"] += usage.get("total_tokens", 0)
+            _add_cost_to_usage(total_usage, usage, model=model)
 
     return stage2_results, label_to_model, total_usage
 
@@ -1514,6 +1607,7 @@ STAGE 2 - Peer Rankings:
     total_usage["prompt_tokens"] = usage.get("prompt_tokens", 0)
     total_usage["completion_tokens"] = usage.get("completion_tokens", 0)
     total_usage["total_tokens"] = usage.get("total_tokens", 0)
+    _add_cost_to_usage(total_usage, usage, model=_get_chairman_model())
 
     response_content = response.get("content", "")
 
@@ -2200,12 +2294,8 @@ async def run_full_council(
         if dissent_text and verdict_result is not None:
             verdict_result.dissent = dissent_text
 
-    # Calculate grand total
-    grand_total = {
-        "prompt_tokens": sum(s["prompt_tokens"] for s in total_usage.values()),
-        "completion_tokens": sum(s["completion_tokens"] for s in total_usage.values()),
-        "total_tokens": sum(s["total_tokens"] for s in total_usage.values()),
-    }
+    # ADR-011: assemble the usage summary (tokens + cost + per-model).
+    usage_summary = _build_usage_summary(total_usage)
 
     # Collect abstention info and score/rank mismatches from Stage 2
     abstentions = []
@@ -2241,7 +2331,7 @@ async def run_full_council(
             "deadlock_detected": deadlock_detected,  # ADR-025b: True if escalated to TIE_BREAKER
             "include_dissent": include_dissent,  # ADR-025b: Dissent extraction enabled
         },
-        "usage": {"by_stage": total_usage, "total": grand_total},
+        "usage": usage_summary,
     }
 
     # ADR-025b: Add verdict result for BINARY/TIE_BREAKER modes

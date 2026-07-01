@@ -16,6 +16,12 @@ import httpx
 # ADR-032: Migrated to unified_config
 from llm_council.unified_config import get_api_key
 
+# ADR-011: per-gateway cost resolution. OpenRouter returns authoritative cost,
+# so no pricing lookup is needed here (provider path).
+from .cost_resolver import CostResolver
+
+_COST_RESOLVER = CostResolver()
+
 # Default constants
 OPENROUTER_API_URL = "https://openrouter.ai/api/v1/chat/completions"
 
@@ -179,6 +185,7 @@ class OpenRouterGateway(BaseRouter):
         disable_tools: bool = False,
         max_tokens: Optional[int] = None,
         temperature: Optional[float] = None,
+        reasoning_params: Optional[ReasoningParams] = None,
     ) -> Dict[str, Any]:
         """Send a query to OpenRouter API.
 
@@ -200,20 +207,17 @@ class OpenRouterGateway(BaseRouter):
             "Content-Type": "application/json",
         }
 
-        payload: Dict[str, Any] = {
-            "model": model,
-            "messages": messages,
-        }
-
-        if disable_tools:
-            payload["tools"] = []
-            payload["tool_choice"] = "none"
-
-        if max_tokens is not None:
-            payload["max_tokens"] = max_tokens
-
-        if temperature is not None:
-            payload["temperature"] = temperature
+        # ADR-026: use the shared payload builder so reasoning_params are
+        # propagated (previously dropped on this gateway path) — identical
+        # tool/token/temperature handling to the inline form it replaces.
+        payload = build_openrouter_payload(
+            model=model,
+            messages=messages,
+            reasoning_params=reasoning_params,
+            max_tokens=max_tokens,
+            temperature=temperature,
+            disable_tools=disable_tools,
+        )
 
         start_time = time.time()
 
@@ -261,6 +265,16 @@ class OpenRouterGateway(BaseRouter):
                         "prompt_tokens": usage.get("prompt_tokens", 0),
                         "completion_tokens": usage.get("completion_tokens", 0),
                         "total_tokens": usage.get("total_tokens", 0),
+                        # ADR-011: OpenRouter returns the authoritative billed
+                        # cost inline; capture it (previously discarded).
+                        "cost": usage.get("cost"),
+                        "cached_tokens": (
+                            usage.get("cached_tokens")
+                            or (usage.get("prompt_tokens_details") or {}).get(
+                                "cached_tokens", 0
+                            )
+                            or 0
+                        ),
                     },
                 }
 
@@ -302,6 +316,7 @@ class OpenRouterGateway(BaseRouter):
             timeout=timeout,
             max_tokens=request.max_tokens,
             temperature=request.temperature,
+            reasoning_params=request.reasoning_params,
         )
 
         # Convert to GatewayResponse
@@ -312,6 +327,14 @@ class OpenRouterGateway(BaseRouter):
                 prompt_tokens=usage_data.get("prompt_tokens", 0),
                 completion_tokens=usage_data.get("completion_tokens", 0),
                 total_tokens=usage_data.get("total_tokens", 0),
+            )
+            # ADR-011: stamp cost_usd + cost_source (provider ground-truth).
+            _COST_RESOLVER.apply(
+                usage,
+                gateway="openrouter",
+                model_id=request.model,
+                provider_cost_usd=usage_data.get("cost"),
+                cached_tokens=usage_data.get("cached_tokens"),
             )
 
         return GatewayResponse(
