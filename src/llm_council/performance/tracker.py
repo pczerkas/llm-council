@@ -6,6 +6,7 @@ building an Internal Performance Index with rolling window decay.
 
 import math
 import os
+from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import List, Optional
@@ -107,7 +108,10 @@ def _calculate_decay_weight(timestamp: str, decay_days: int) -> float:
         if record_time.tzinfo is None:
             record_time = record_time.replace(tzinfo=timezone.utc)
         now = datetime.now(timezone.utc)
-        days_ago = (now - record_time).total_seconds() / (24 * 3600)
+        # Clamp to >= 0: a future timestamp (clock skew) would otherwise give a
+        # negative age and a weight > 1, over-weighting the record. Treat future
+        # records as "now" (weight 1.0).
+        days_ago = max((now - record_time).total_seconds() / (24 * 3600), 0.0)
 
         # Exponential decay: e^(-days_ago / decay_days)
         return math.exp(-days_ago / decay_days)
@@ -151,13 +155,18 @@ class InternalPerformanceTracker:
         """Record performance metrics from a completed council session.
 
         Args:
-            session_id: UUID of the council session
+            session_id: UUID of the council session — stamped onto every metric
+                as the authoritative session id (so records are consistent even
+                if a caller left it unset or mismatched).
             metrics: List of per-model metrics from the session
 
         Returns:
             Number of records written
         """
-        return append_performance_records(metrics, self.store_path)
+        # Stamp the authoritative session_id WITHOUT mutating the caller's
+        # objects (record_session must have no side effects on its inputs).
+        stamped = [replace(metric, session_id=session_id) for metric in metrics]
+        return append_performance_records(stamped, self.store_path)
 
     def get_model_index(self, model_id: str) -> ModelPerformanceIndex:
         """Get aggregated performance index for a model.
@@ -217,7 +226,9 @@ class InternalPerformanceTracker:
         # should count in full, not be discounted by age.
         parse_success_rate = parse_success_count / sample_size if sample_size > 0 else 1.0
 
-        # Latency percentiles
+        # Latency percentiles — intentionally UNWEIGHTED (percentiles are taken
+        # over the raw sample set; recency-weighting order statistics is
+        # non-standard and would distort p50/p95).
         p50_latency = _calculate_percentile(latencies, 50)
         p95_latency = _calculate_percentile(latencies, 95)
 
@@ -241,7 +252,10 @@ class InternalPerformanceTracker:
     def get_quality_score(self, model_id: str) -> float:
         """Get normalized quality score for model selection.
 
-        Returns a 0-100 score based on mean Borda performance.
+        Returns a 0-100 score based on mean Borda performance. This 0-100 scale
+        is intentional and selection-facing (consumed by selection.py); it is
+        deliberately distinct from ``get_all_model_scores``' raw 0-1 scale used
+        by the percentile math — the two must not be compared directly.
         Cold-start models get a neutral score of 50.
 
         Args:
