@@ -2,6 +2,8 @@
 
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import pytest
+
 import llm_council.gateway.openrouter as gw_mod
 from llm_council.gateway.openrouter import OpenRouterGateway
 from llm_council.gateway.types import CanonicalMessage, ContentBlock, GatewayRequest
@@ -87,3 +89,91 @@ class TestToolCallPreservation:
         out = gw._convert_message(msg)
         assert "tool_calls" not in out
         assert "tool_call_id" not in out
+
+
+class TestReasoningDetailsSurfaced:
+    async def test_complete_surfaces_reasoning_details(self):
+        gw = OpenRouterGateway()
+        fake = {
+            "status": "ok",
+            "content": "answer",
+            "latency_ms": 10,
+            "reasoning_details": [{"type": "reasoning", "text": "thinking..."}],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+        }
+        with patch.object(gw, "_query_openrouter", new=AsyncMock(return_value=fake)):
+            resp = await gw.complete(_req())
+        assert resp.reasoning_details == [{"type": "reasoning", "text": "thinking..."}]
+
+
+class _FakeStream:
+    def __init__(self, lines, status_code=200):
+        self._lines = lines
+        self.status_code = status_code
+        self.request = MagicMock()
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *a):
+        return False
+
+    async def aiter_lines(self):
+        for line in self._lines:
+            yield line
+
+    async def aread(self):
+        return b"error body"
+
+
+class _FakeClient:
+    def __init__(self, lines, status_code=200):
+        self._lines = lines
+        self._status_code = status_code
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *a):
+        return False
+
+    def stream(self, method, url, headers=None, json=None):
+        return _FakeStream(self._lines, self._status_code)
+
+
+class TestTrueStreaming:
+    async def test_yields_content_deltas(self, monkeypatch):
+        monkeypatch.setattr(gw_mod, "get_api_key", lambda p: "k")
+        lines = [
+            'data: {"choices":[{"delta":{"content":"Hel"}}]}',
+            'data: {"choices":[{"delta":{"content":"lo"}}]}',
+            "data: [DONE]",
+            'data: {"choices":[{"delta":{"content":"IGNORED"}}]}',
+        ]
+        with patch("httpx.AsyncClient", return_value=_FakeClient(lines)):
+            chunks = [c async for c in OpenRouterGateway().complete_stream(_req())]
+        assert chunks == ["Hel", "lo"]  # stops at [DONE], skips nothing else
+
+    async def test_skips_malformed_and_empty_lines(self, monkeypatch):
+        monkeypatch.setattr(gw_mod, "get_api_key", lambda p: "k")
+        lines = [
+            "",
+            ": comment",
+            "data: not-json",
+            'data: {"choices":[{"delta":{}}]}',  # no content
+            'data: {"choices":[{"delta":{"content":"ok"}}]}',
+        ]
+        with patch("httpx.AsyncClient", return_value=_FakeClient(lines)):
+            chunks = [c async for c in OpenRouterGateway().complete_stream(_req())]
+        assert chunks == ["ok"]
+
+
+class TestStreamingErrorHandling:
+    async def test_http_error_raises_not_silent(self, monkeypatch):
+        import httpx
+
+        monkeypatch.setattr(gw_mod, "get_api_key", lambda p: "k")
+        with patch("httpx.AsyncClient", return_value=_FakeClient([], status_code=500)):
+            with pytest.raises(httpx.HTTPStatusError):
+                async for _ in OpenRouterGateway().complete_stream(_req()):
+                    pass
