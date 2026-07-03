@@ -19,6 +19,7 @@ Architectural Principles (ADR-024):
 5. Observability by Default: Every layer emits metrics, logs, and traces
 """
 
+from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
@@ -156,8 +157,11 @@ class LayerEvent:
     layer_to: Optional[str] = None
 
 
-# Global event store (in-memory for now, can be replaced with proper sink)
-_layer_events: List[LayerEvent] = []
+# Global event store — bounded ring buffer (ADR-045 P3 audit): a long-lived
+# server process must not grow this unboundedly; durable observability goes
+# through the metrics adapters (ADR-030), this buffer is a debugging window.
+MAX_LAYER_EVENTS = 1000
+_layer_events: "deque[LayerEvent]" = deque(maxlen=MAX_LAYER_EVENTS)
 
 # Logger for layer events
 logger = logging.getLogger("llm_council.layers")
@@ -221,7 +225,12 @@ def get_layer_events() -> List[LayerEvent]:
 def clear_layer_events() -> None:
     """Clear all layer events.
 
-    Typically called at the start of a new request.
+    Typically called at the start of a new request. NOTE: this buffer is a
+    process-wide best-effort debugging window, not the observability system —
+    durable metrics flow through the ADR-030 adapters at emit time, so
+    clearing (or ring-buffer overflow) never loses exported metrics. In a
+    concurrent server, prefer reading via get_layer_events() deltas over
+    clearing.
     """
     _layer_events.clear()
 
@@ -249,7 +258,9 @@ def validate_tier_contract(contract: TierContract) -> bool:
     if not isinstance(contract, TierContract):
         raise ValueError(f"Expected TierContract, got {type(contract)}")
 
-    if contract.tier not in ("quick", "balanced", "high", "reasoning"):
+    # Keep in sync with tier_contract.py — frontier is a valid tier
+    # (ADR-022/027); its omission here rejected valid L1 contracts.
+    if contract.tier not in ("quick", "balanced", "high", "reasoning", "frontier"):
         raise ValueError(f"Invalid tier: {contract.tier}")
 
     if not contract.allowed_models or len(contract.allowed_models) == 0:

@@ -84,6 +84,16 @@ class TestTierContractValidation:
         with pytest.raises(ValueError, match="(?i)tier|none"):
             validate_tier_contract(None)
 
+    def test_frontier_tier_contract_validates(self):
+        """frontier is a valid tier (ADR-022/027) — validation must accept it.
+
+        Pre-existing bug caught by the #406 council review: the validator's
+        tier whitelist omitted 'frontier' while create_tier_contract and the
+        rest of the tier system accept it.
+        """
+        contract = create_tier_contract("frontier")
+        assert validate_tier_contract(contract) is True
+
     def test_tier_contract_has_allowed_models(self):
         """TierContract must have at least one allowed model."""
         contract = create_tier_contract("high")
@@ -381,3 +391,27 @@ class TestLayerSovereignty:
         assert "from_tier" in events[0].data
         assert "to_tier" in events[0].data
         assert "reason" in events[0].data
+
+
+class TestLayerEventBufferBound:
+    def test_event_buffer_is_bounded(self):
+        # ADR-045 P3 audit: the in-memory event store must not grow unbounded
+        # in a long-lived server process (only tests ever cleared it).
+        from llm_council.layer_contracts import (
+            MAX_LAYER_EVENTS,
+            LayerEventType,
+            clear_layer_events,
+            emit_layer_event,
+            get_layer_events,
+        )
+
+        clear_layer_events()
+        try:
+            for i in range(MAX_LAYER_EVENTS + 50):
+                emit_layer_event(LayerEventType.L1_TIER_SELECTED, {"i": i})
+            events = get_layer_events()
+            assert len(events) == MAX_LAYER_EVENTS
+            # Oldest were dropped; newest survive.
+            assert events[-1].data["i"] == MAX_LAYER_EVENTS + 49
+        finally:
+            clear_layer_events()
