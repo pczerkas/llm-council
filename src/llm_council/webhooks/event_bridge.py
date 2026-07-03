@@ -85,12 +85,24 @@ def _map_stage_complete(event: LayerEvent) -> Optional[WebhookEventType]:
 # Some entries are direct mappings, others are callables for conditional mapping
 LAYER_TO_WEBHOOK_MAPPING: Dict[LayerEventType, Union[WebhookEventType, StageMapper]] = {
     LayerEventType.L3_COUNCIL_START: WebhookEventType.DELIBERATION_START,
+    LayerEventType.L3_STAGE1_RESPONSE: WebhookEventType.STAGE1_RESPONSE,
+    LayerEventType.L3_STAGE2_REVIEW: WebhookEventType.STAGE2_REVIEW,
+    LayerEventType.L3_STAGE3_START: WebhookEventType.STAGE3_START,
+    LayerEventType.L3_EARLY_CONSENSUS_TERMINATION: WebhookEventType.CONSENSUS_EARLY_TERMINATION,
     LayerEventType.L3_COUNCIL_COMPLETE: WebhookEventType.COMPLETE,
     LayerEventType.L3_STAGE_COMPLETE: _map_stage_complete,
     LayerEventType.L3_MODEL_TIMEOUT: WebhookEventType.ERROR,
     # L4 gateway errors also map to council.error
     LayerEventType.L4_CIRCUIT_BREAKER_OPEN: WebhookEventType.ERROR,
 }
+
+
+def map_layer_event_to_webhook(event: LayerEvent) -> "Optional[WebhookEventType]":
+    """Resolve the WebhookEventType for a LayerEvent (ADR-046 P1 helper)."""
+    mapping = LAYER_TO_WEBHOOK_MAPPING.get(event.event_type)
+    if mapping is None:
+        return None
+    return mapping(event) if callable(mapping) else mapping
 
 
 def transform_layer_event_to_webhook(
@@ -169,6 +181,11 @@ class EventBridge:
         # Parse subscribed events from config
         if self.webhook_config is not None:
             self._subscribed_events = set(self.webhook_config.events)
+        elif self.on_event is not None:
+            # A local callback with no webhook config subscribes to every
+            # mapped event — an empty set here silently suppressed ALL
+            # events for on_event-only consumers (#430 review).
+            self._subscribed_events = {e.value for e in WebhookEventType}
 
     @property
     def is_running(self) -> bool:
