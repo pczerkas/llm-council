@@ -33,11 +33,22 @@ _lock = threading.Lock()
 _client: Optional[Any] = None
 _init_attempted = False
 _atexit_registered = False
+_shutdown_done = False
 
 
 def posthog_emission_enabled() -> bool:
     """True iff a PostHog project key is configured (opt-in, off by default)."""
     return bool(os.getenv("POSTHOG_API_KEY"))
+
+
+def scrub_exception(exc: BaseException) -> str:
+    """Return the exception TYPE name only (ADR-050 Part 2 residual-leakage rule).
+
+    Provider/gateway errors sometimes echo the prompt in their message; the
+    soft-fail paths log this scrubbed form so customer code can never leak into
+    a debug log (and never into a property).
+    """
+    return type(exc).__name__
 
 
 def _get_client() -> Optional[Any]:
@@ -73,7 +84,7 @@ def _get_client() -> Optional[Any]:
                 atexit.register(shutdown)
                 _atexit_registered = True
         except Exception as exc:  # missing SDK, bad config — soft-fail
-            logger.debug("posthog emitter init failed (disabled): %s", exc)
+            logger.debug("posthog emitter init failed (disabled): %s", scrub_exception(exc))
             _client = None
         return _client
 
@@ -90,7 +101,7 @@ def emit(event: str, properties: Dict[str, Any], distinct_id: str) -> None:
             return
         client.capture(distinct_id=distinct_id, event=event, properties=properties)
     except Exception as exc:  # emission must never break a run
-        logger.debug("posthog emit failed for %s (ignored): %s", event, exc)
+        logger.debug("posthog emit failed for %s (ignored): %s", event, scrub_exception(exc))
 
 
 def shutdown(timeout: float = _FLUSH_TIMEOUT_S) -> None:
@@ -101,10 +112,15 @@ def shutdown(timeout: float = _FLUSH_TIMEOUT_S) -> None:
     with the process). Registered via ``atexit`` on client init; also safe to
     call explicitly from a CLI/gate teardown.
     """
+    global _shutdown_done
     with _lock:  # snapshot under the lock — a concurrent reset must not race
+        # Idempotent: atexit + an explicit teardown call must not double-flush.
+        if _shutdown_done:
+            return
         client = _client
-    if client is None:
-        return
+        if client is None:
+            return
+        _shutdown_done = True
 
     def _flush() -> None:
         try:
@@ -112,7 +128,7 @@ def shutdown(timeout: float = _FLUSH_TIMEOUT_S) -> None:
             if fn is not None:
                 fn()
         except Exception as exc:  # flush failure is non-fatal
-            logger.debug("posthog shutdown failed (ignored): %s", exc)
+            logger.debug("posthog shutdown failed (ignored): %s", scrub_exception(exc))
 
     t = threading.Thread(target=_flush, name="posthog-flush", daemon=True)
     t.start()
@@ -126,7 +142,8 @@ def reset_for_testing() -> None:
     process-global and idempotent (None-guarded), so it must be registered at
     most once for the process, never re-registered per test.
     """
-    global _client, _init_attempted
+    global _client, _init_attempted, _shutdown_done
     with _lock:
         _client = None
         _init_attempted = False
+        _shutdown_done = False
