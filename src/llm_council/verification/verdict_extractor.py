@@ -379,6 +379,13 @@ def build_verification_result(
     """
     rubric_scores = extract_rubric_scores_from_rankings(stage2_results)
 
+    # ADR-051 C5 (#489): capture the pre-softening state whenever an
+    # "approved @ c" is softened to "unclear" (c < threshold), for the
+    # telemetry-only diagnostics block.
+    inner_verdict: Optional[str] = None
+    inner_confidence: Optional[float] = None
+    inner_confidence_calibrated: Optional[float] = None
+
     structured_verdict = _verdict_from_structured(verdict_result)
     if structured_verdict is not None:
         # Trust the council's structured BINARY verdict.
@@ -389,6 +396,9 @@ def build_verification_result(
         # confidence (raw is always reported alongside).
         effective = calibrate(confidence) if calibrate is not None else confidence
         if verdict == "pass" and effective < confidence_threshold:
+            inner_verdict, inner_confidence, inner_confidence_calibrated = (
+                "pass", confidence, effective,
+            )
             verdict = "unclear"
     else:
         # Fallback: legacy regex extraction over the synthesis prose.
@@ -398,6 +408,9 @@ def build_verification_result(
         confidence = round((base_confidence * 0.4) + (agreement_confidence * 0.6), 2)
         effective = calibrate(confidence) if calibrate is not None else confidence
         if verdict == "pass" and effective < confidence_threshold:
+            inner_verdict, inner_confidence, inner_confidence_calibrated = (
+                "pass", confidence, effective,
+            )
             verdict = "unclear"
 
     # Extract blocking issues (only for fail/unclear)
@@ -436,37 +449,53 @@ def build_verification_result(
             if reason:
                 diagnostics["fallback_reason"] = reason
             if source == "structured":
-                # C3 mechanical gate: verdict = policy(findings) (pure host
-                # code); blocking_issues = the critical subset. The confidence
-                # softening to "unclear" is the SAME rule as the legacy path.
+                # C3 mechanical gate: verdict = policy(findings) (pure host code);
+                # blocking_issues = the critical subset. Compute EVERYTHING into
+                # locals first, then mutate `result` atomically at the end — so a
+                # mid-computation exception leaves the legacy result intact rather
+                # than a half-updated verdict/confidence (Council C5 round 2).
                 mechanical = verdict_policy(parsed)
-                eff = calibrate(confidence) if calibrate is not None else confidence
-                if mechanical == "pass" and eff < confidence_threshold:
+                # Confidence must correspond to the mechanical verdict it
+                # accompanies, not the discarded legacy one (Council C5 round 1).
+                mech_conf = calculate_confidence_from_agreement(stage2_results, mechanical)
+                # Calibrate ONCE, here in the compute section — the apply block
+                # below must contain no throwing calls, so it reuses this local
+                # rather than calling calibrate() again (Council C5 round 3).
+                mech_calibrated = calibrate(mech_conf) if calibrate is not None else None
+                mech_eff = mech_calibrated if mech_calibrated is not None else mech_conf
+                _inner: Optional[Tuple[str, float, Optional[float]]] = None
+                if mechanical == "pass" and mech_eff < confidence_threshold:
+                    _inner = ("pass", mech_conf, mech_eff)
                     mechanical = "unclear"
-                result["verdict"] = mechanical
-                result["blocking_issues"] = [
-                    {
-                        "severity": f.severity,
-                        "description": f.description,
-                        "location": f.location,
-                    }
+                mech_blocking = [
+                    {"severity": f.severity, "description": f.description, "location": f.location}
                     for f in parsed
                     if f.severity == "critical"
                 ]
-                diagnostics["verdict_source"] = "mechanical"
-                # C4: severity-distribution telemetry (mis-labelling signal).
                 by_sev: Dict[str, int] = {}
                 for f in parsed:
                     by_sev[f.severity] = by_sev.get(f.severity, 0) + 1
-                diagnostics["findings_by_severity"] = by_sev
-                # C4: defensive invariant — under the mechanical gate a `fail`
-                # iff a critical exists is guaranteed; if it's ever violated
-                # that's a gate-policy BUG (never model behavior), so mark it.
                 has_critical = any(f.severity == "critical" for f in parsed)
+                mismatch = None
                 if (mechanical == "fail") != has_critical:
-                    diagnostics["verdict_evidence_mismatch"] = (
+                    mismatch = (
                         "fail_without_critical" if mechanical == "fail" else "nonfail_with_critical"
                     )
+
+                # --- all computed; apply atomically (no throwing calls below) ---
+                result["verdict"] = mechanical
+                result["confidence"] = mech_conf
+                result["confidence_calibrated"] = mech_calibrated
+                result["blocking_issues"] = mech_blocking
+                diagnostics["verdict_source"] = "mechanical"
+                diagnostics["findings_by_severity"] = by_sev
+                # Discard any inner-verdict captured during the (now-overridden)
+                # legacy softening; re-set only if the mechanical verdict softened.
+                inner_verdict = inner_confidence = inner_confidence_calibrated = None
+                if _inner is not None:
+                    inner_verdict, inner_confidence, inner_confidence_calibrated = _inner
+                if mismatch is not None:
+                    diagnostics["verdict_evidence_mismatch"] = mismatch
                     logger.error(
                         "ADR-051 mechanical-gate invariant violated: verdict=%s has_critical=%s",
                         mechanical,
@@ -474,6 +503,13 @@ def build_verification_result(
                     )
         except Exception:  # telemetry must never break a verdict
             diagnostics["fallback_reason"] = "findings_exception"
+    # ADR-051 C5: surface the pre-softening inner verdict under diagnostics
+    # (telemetry-only) so automation can tell "approved but under threshold"
+    # from "genuinely undecided" without parsing prose.
+    if inner_verdict is not None:
+        diagnostics["inner_verdict"] = inner_verdict
+        diagnostics["inner_confidence"] = inner_confidence
+        diagnostics["inner_confidence_calibrated"] = inner_confidence_calibrated
     result["findings"] = findings_dicts
     result["diagnostics"] = diagnostics
     return result
