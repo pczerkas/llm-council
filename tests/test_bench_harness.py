@@ -4,10 +4,18 @@ Unit-tested with mocked councils — NO live spend in CI. Spend-cap abort,
 monthly guard, envelope semantics, baseline drift, exit codes 0/1/2.
 """
 
+import asyncio
 import json
+import threading
+import time
 from pathlib import Path
 
 import pytest
+
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - Windows
+    fcntl = None
 
 from llm_council.bench import (
     BenchItem,
@@ -73,6 +81,52 @@ class TestEnvelope:
         fails = check_envelope(item, "only fizz here", None)
         assert len(fails) == 1 and "required" in fails[0]
 
+    def test_word_boundary_no_substring_false_positive(self):
+        # #506: "major" must NOT be satisfied by "majority" (substring bug).
+        item = BenchItem(
+            id="x", domain="factual", prompt="p",
+            envelope={"must_contain": [["major"]]},
+        )
+        fails = check_envelope(item, "the majority voted", None)
+        assert len(fails) == 1 and "major" in fails[0]
+        # but a real whole-word "major" still passes
+        assert check_envelope(item, "a major version bump", None) == []
+
+    def test_word_boundary_numeric_token(self):
+        # #506: "66" must not match "1966".
+        item = BenchItem(
+            id="x", domain="reasoning", prompt="p",
+            envelope={"must_contain": [["66"]]},
+        )
+        assert check_envelope(item, "released in 1966", None) != []
+        assert check_envelope(item, "the answer is 66 percent", None) == []
+
+    def test_punctuation_token_still_matches(self):
+        # #506: a token with no word boundary (e.g. "?") must still match by
+        # presence — word-boundary anchoring only applies at word-char edges.
+        item = BenchItem(
+            id="x", domain="coding", prompt="p",
+            envelope={"must_contain": [["?", "parameter"]]},
+        )
+        assert check_envelope(item, "use cur.execute(sql, (x,)) with a ?", None) == []
+        # dotted/punctuated multi-char token matches as a whole word
+        item2 = BenchItem(
+            id="y", domain="coding", prompt="p",
+            envelope={"must_contain": [["os.system"]]},
+        )
+        assert check_envelope(item2, "avoid os.system on user input", None) == []
+        assert check_envelope(item2, "the ecosystem is large", None) != []
+
+    def test_token_punctuation_edge_not_substring(self):
+        # #506 review: a token whose last char is non-word ("c++") must not
+        # match inside a longer token ("c++abc").
+        item = BenchItem(
+            id="x", domain="coding", prompt="p",
+            envelope={"must_contain": [["c++"]]},
+        )
+        assert check_envelope(item, "written in c++ today", None) == []
+        assert check_envelope(item, "the c++abc library", None) != []
+
     def test_score_floor(self):
         item = BenchItem(id="x", domain="f", prompt="p", envelope={"min_score": 0.5})
         assert check_envelope(item, "text", 0.6) == []
@@ -133,6 +187,202 @@ class TestRun:
         assert run.aborted and "per_run_cap" in run.aborted
         assert run.items_run == 2  # partial results kept
         assert len(run.results) == 2
+
+    @pytest.mark.asyncio
+    async def test_final_item_overshoot_not_silent_exit0(self, tmp_path):
+        # #510/#511 (Council critical): the between-item cap check never sees
+        # an overshoot caused by the FINAL item — a 1-item run over cap used to
+        # complete as a silent exit-0. It must signal exit 2 with a cap reason.
+        d = tmp_path / "ds"
+        d.mkdir()
+        _write_item(d, "only")
+
+        async def runner(prompt):
+            return _fake_result("hello", cost=5.00)  # single item blows the cap
+
+        run = await run_bench(
+            dataset_dir=d, runs_dir=tmp_path / "runs",
+            council_runner=runner, max_usd=1.00,
+        )
+        assert run.items_run == 1  # the item did run (cap is between-item)
+        assert run.aborted and "per_run_cap" in run.aborted
+        assert run.exit_code == 2  # not a silent 0
+
+    @pytest.mark.asyncio
+    async def test_unknown_items_id_raises(self, tmp_path):
+        # #508: a typo'd --items id must not silently produce a green 0/0 run.
+        d = tmp_path / "ds"
+        d.mkdir()
+        _write_item(d, "real")
+
+        async def runner(prompt):
+            return _fake_result("hello")
+
+        with pytest.raises(ValueError, match="unknown --items"):
+            await run_bench(
+                dataset_dir=d, runs_dir=tmp_path / "runs",
+                council_runner=runner, items_filter=["typo"],
+            )
+
+    @pytest.mark.asyncio
+    async def test_empty_dataset_is_rejected_not_green(self, tmp_path):
+        # #508: an empty dataset must not silently produce a green run. It is
+        # rejected at load (load_dataset raises); the run-level items_run==0
+        # guard is defence-in-depth for any other zero-item path.
+        d = tmp_path / "ds"
+        d.mkdir()  # no items
+
+        async def runner(prompt):
+            return _fake_result("hello")
+
+        with pytest.raises(ValueError):
+            await run_bench(
+                dataset_dir=d, runs_dir=tmp_path / "runs", council_runner=runner
+            )
+
+    def test_month_to_date_skips_unreadable_artefact_not_silent(self, tmp_path, caplog):
+        # Council critical: a corrupt artefact must not silently vanish from the
+        # financial guard — it's skipped WITH a warning, and readable spend still
+        # counts (no crash, no fail-open silence).
+        runs = tmp_path / "runs"
+        runs.mkdir()
+        prefix = __import__("datetime").datetime.now(
+            __import__("datetime").timezone.utc
+        ).strftime("%Y-%m")
+        (runs / "run-good.json").write_text(
+            json.dumps({"started_at": f"{prefix}-01T00:00:00+00:00", "cap_charged_usd": 1.5})
+        )
+        (runs / "run-corrupt.json").write_text("{not valid json")
+        # null spend must not crash the tally either
+        (runs / "run-null.json").write_text(
+            json.dumps({"started_at": f"{prefix}-02T00:00:00+00:00", "cap_charged_usd": None,
+                        "total_cost_usd": 0.5})
+        )
+        with caplog.at_level("WARNING"):
+            total = month_to_date_spend(runs)
+        assert total == 2.0  # 1.5 (good) + 0.5 (null→total fallback); corrupt skipped
+        assert any("unreadable" in r.message for r in caplog.records)
+
+    def test_format_report_shows_effective_cap(self):
+        from llm_council.bench.harness import BenchRun
+
+        run = BenchRun(
+            started_at="2026-07-07T00:00:00+00:00",
+            items_total=1, items_run=1, items_passed=1,
+            total_cost_usd=0.1, cost_known=True, cap_usd=0.75,
+        )
+        report = format_report(run, {"baseline": None}, "md")
+        assert "per-run cap $0.75" in report  # #509: effective, not env default
+
+    @pytest.mark.asyncio
+    async def test_filtered_run_flag_and_baseline_refuses(self, tmp_path):
+        # #517: a --items-scoped run must be flagged, and set_baseline must
+        # refuse it (silently shrinking baseline coverage is a real gap, but
+        # a MAJOR one, not data-loss/security/crash-critical).
+        d = tmp_path / "ds"
+        d.mkdir()
+        _write_item(d, "a")
+        _write_item(d, "b")
+
+        async def runner(prompt):
+            return _fake_result("hello")
+
+        run = await run_bench(
+            dataset_dir=d, runs_dir=tmp_path / "runs",
+            council_runner=runner, items_filter=["a"],
+        )
+        assert run.filtered is True
+        with pytest.raises(ValueError, match="filtered"):
+            set_baseline(run, tmp_path / "baseline.json")
+
+        # A full (unfiltered) run is NOT flagged and baselines normally.
+        full_run = await run_bench(
+            dataset_dir=d, runs_dir=tmp_path / "runs2", council_runner=runner
+        )
+        assert full_run.filtered is False
+        set_baseline(full_run, tmp_path / "baseline2.json")  # must not raise
+
+    @pytest.mark.skipif(fcntl is None, reason="fcntl is Unix-only")
+    @pytest.mark.asyncio
+    async def test_monthly_guard_lock_is_exclusive(self, tmp_path):
+        # #516: the lock must be a REAL OS-level exclusive lock on a shared
+        # file, not just plumbing — probe it directly rather than relying on
+        # asyncio orchestration (which can't reliably force the TOCTOU race).
+        from llm_council.bench.harness import _monthly_guard_lock
+
+        async with _monthly_guard_lock(tmp_path):
+            lock_path = tmp_path / ".monthly-guard.lock"
+            assert lock_path.exists()
+            # A second, independent open on the SAME lock file must fail to
+            # acquire non-blocking while the context manager holds it.
+            with open(lock_path, "a+") as probe:
+                with pytest.raises(BlockingIOError):
+                    fcntl.flock(probe.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        # Released on exit: the probe can now acquire it.
+        with open(lock_path, "a+") as probe:
+            fcntl.flock(probe.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            fcntl.flock(probe.fileno(), fcntl.LOCK_UN)
+
+    @pytest.mark.asyncio
+    async def test_monthly_guard_lock_does_not_block_event_loop(self, tmp_path):
+        # Round 6 review: fcntl.flock is a blocking syscall; a naive
+        # synchronous acquire held across awaits would, on contention, freeze
+        # the WHOLE event loop (every task in the process), not just the
+        # calling coroutine. Prove a concurrent heartbeat task keeps ticking
+        # while _monthly_guard_lock waits on a lock held elsewhere.
+        from llm_council.bench.harness import _monthly_guard_lock
+
+        tmp_path.mkdir(parents=True, exist_ok=True)
+        lock_path = tmp_path / ".monthly-guard.lock"
+        holder_fh = open(lock_path, "a+")
+        fcntl.flock(holder_fh.fileno(), fcntl.LOCK_EX)  # simulate another holder
+
+        def release_after_delay():
+            time.sleep(0.3)
+            fcntl.flock(holder_fh.fileno(), fcntl.LOCK_UN)
+            holder_fh.close()
+
+        threading.Thread(target=release_after_delay, daemon=True).start()
+
+        heartbeats = 0
+
+        async def heartbeat():
+            nonlocal heartbeats
+            while True:
+                heartbeats += 1
+                await asyncio.sleep(0.02)
+
+        hb_task = asyncio.create_task(heartbeat())
+        try:
+            async with _monthly_guard_lock(tmp_path):
+                pass
+        finally:
+            hb_task.cancel()
+
+        # ~0.3s of contention at a 0.02s heartbeat interval => many ticks if
+        # the event loop stayed responsive; a blocking flock() would have
+        # frozen it (heartbeats stuck at 0 or 1).
+        assert heartbeats >= 5
+
+    def test_persist_run_unique_filenames_same_second(self, tmp_path):
+        # #510: whole-second stamps collided (second run overwrote the first),
+        # dropping the lost run's spend from the monthly ledger.
+        from llm_council.bench.harness import BenchRun, _persist_run
+
+        runs = tmp_path / "runs"
+        r1 = BenchRun(
+            started_at="2026-07-07T08:21:26.111111+00:00",
+            items_total=1, items_run=1, items_passed=1,
+            total_cost_usd=0.5, cost_known=True,
+        )
+        r2 = BenchRun(
+            started_at="2026-07-07T08:21:26.999999+00:00",  # same second
+            items_total=1, items_run=1, items_passed=1,
+            total_cost_usd=0.7, cost_known=True,
+        )
+        _persist_run(r1, runs)
+        _persist_run(r2, runs)
+        assert len(list(runs.glob("*.json"))) == 2  # both preserved
 
     @pytest.mark.asyncio
     async def test_monthly_guard_refuses_run(self, tmp_path, monkeypatch):
@@ -255,7 +505,7 @@ class TestCouncilRound1:
         assert run.items_run == 2
         assert run.total_cost_usd == 0.0  # actuals never fabricated
 
-    def test_corrupt_baseline_reported_not_crash(self, tmp_path):
+    def test_corrupt_baseline_reported_not_crash(self, tmp_path, caplog):
         from llm_council.bench.harness import BenchRun
 
         bp = tmp_path / "baseline.json"
@@ -264,8 +514,26 @@ class TestCouncilRound1:
             started_at="t", items_total=0, items_run=0,
             items_passed=0, total_cost_usd=0.0, cost_known=False,
         )
-        cmp = compare_to_baseline(run, bp)
+        with caplog.at_level("WARNING"):
+            cmp = compare_to_baseline(run, bp)
         assert cmp == {"baseline": None}
+        # round-5 review: corrupt must be distinguishable from "no baseline
+        # yet" (below) — via a warning, not an identical silent report.
+        assert any("corrupt" in r.message for r in caplog.records)
+
+    def test_missing_baseline_is_silent(self, tmp_path, caplog):
+        # The "no baseline committed yet" case is expected/routine — NOT a
+        # warning (only genuine corruption should log).
+        from llm_council.bench.harness import BenchRun
+
+        run = BenchRun(
+            started_at="t", items_total=0, items_run=0,
+            items_passed=0, total_cost_usd=0.0, cost_known=False,
+        )
+        with caplog.at_level("WARNING"):
+            cmp = compare_to_baseline(run, tmp_path / "does-not-exist.json")
+        assert cmp == {"baseline": None}
+        assert not caplog.records
 
 
 class TestCouncilRound2:
