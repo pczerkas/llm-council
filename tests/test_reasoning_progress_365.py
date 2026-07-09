@@ -11,7 +11,9 @@ async def test_forwards_reasoning_params_to_each_model(monkeypatch):
     rp = ReasoningParams(effort="high", max_tokens=1000)
     captured = {}
 
-    async def _fake_status(model, messages, timeout=120.0, disable_tools=False, reasoning_params=None):
+    async def _fake_status(
+        model, messages, timeout=120.0, disable_tools=False, reasoning_params=None
+    ):
         captured[model] = reasoning_params
         return {"status": "ok", "content": "x", "latency_ms": 1, "usage": {}}
 
@@ -26,7 +28,9 @@ async def test_forwards_reasoning_params_to_each_model(monkeypatch):
 async def test_none_reasoning_params_still_works(monkeypatch):
     captured = {}
 
-    async def _fake_status(model, messages, timeout=120.0, disable_tools=False, reasoning_params=None):
+    async def _fake_status(
+        model, messages, timeout=120.0, disable_tools=False, reasoning_params=None
+    ):
         captured[model] = reasoning_params
         return {"status": "ok", "content": "x", "latency_ms": 1, "usage": {}}
 

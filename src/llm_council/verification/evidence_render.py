@@ -11,6 +11,7 @@ from .schemas import BlockingEvidenceTooLarge, EvidenceItem, EvidenceWarning
 
 logger = logging.getLogger(__name__)
 
+
 def _budget_evidence(
     evidence: Optional[List[EvidenceItem]],
     tier: str,
