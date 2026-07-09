@@ -18,14 +18,26 @@ Exit codes: 0 within envelope, 1 drift beyond envelope, 2 aborted/partial.
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import json
 import logging
 import os
+import re
 import time
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
+
+# File locking - use fcntl on Unix, fallback to no-op on Windows (same
+# precedent as triage/rollback_metrics.py).
+try:
+    import fcntl
+
+    _HAS_FCNTL = True
+except ImportError:
+    _HAS_FCNTL = False
 
 logger = logging.getLogger(__name__)
 
@@ -36,6 +48,49 @@ DEFAULT_RUNS_DIR = Path(".council") / "bench" / "runs"
 EXIT_OK = 0
 EXIT_DRIFT = 1
 EXIT_ABORTED = 2
+
+
+@contextlib.asynccontextmanager
+async def _monthly_guard_lock(runs_dir: Path) -> Any:
+    """Serialize the monthly-guard check-through-persist section (#516).
+
+    Without this, two concurrent ``bench run`` invocations (separate
+    processes) can both read the same month-to-date spend, both pass the
+    guard, then both write — jointly exceeding
+    ``LLM_COUNCIL_BENCH_MONTHLY_USD`` (a time-of-check-to-time-of-use race).
+    Concurrent bench runs aren't the documented usage ("on-demand or nightly,
+    never per-PR"), so full mutual exclusion for the run's duration is an
+    acceptable, simple fix rather than a partial/periodic re-check. Unix-only
+    (fcntl); a no-op on Windows, matching the existing precedent in
+    triage/rollback_metrics.py.
+
+    ASYNC on purpose (round 6 review): ``fcntl.flock`` is a blocking syscall
+    held across the ``await``s inside the guarded section. A plain
+    synchronous acquire would, on contention, block the WHOLE event loop —
+    not just the calling coroutine — freezing every other task in the
+    process for as long as the lock is held (potentially minutes). No
+    current call site runs two ``run_bench`` coroutines concurrently in one
+    process (``bench matrix`` awaits them sequentially), so this cannot fire
+    today, but the failure mode (a full event-loop freeze, not a clean
+    queued wait) is bad enough to close categorically rather than leave as a
+    footgun for a future concurrent caller. ``asyncio.to_thread`` moves the
+    blocking acquire off the event loop thread so a contended lock merely
+    suspends the awaiting coroutine.
+    """
+    if not _HAS_FCNTL:
+        yield
+        return
+    runs_dir.mkdir(parents=True, exist_ok=True)
+    lock_path = runs_dir / ".monthly-guard.lock"
+    fh = open(lock_path, "a+")
+    try:
+        await asyncio.to_thread(fcntl.flock, fh.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+    finally:
+        fh.close()
 
 
 def bench_max_usd() -> float:
@@ -95,7 +150,12 @@ class BenchRun:
     # The monthly guard sums THIS, not raw actuals (#439 r3) — unknown-cost
     # runs must not erode the guard.
     cap_charged_usd: float = 0.0
+    cap_usd: Optional[float] = None  # effective per-run cap (may be a --max-usd override)
     aborted: Optional[str] = None  # reason string when partial
+    # True when --items scoped this run to a subset of the dataset (#517):
+    # set_baseline must refuse a filtered run so the baseline never silently
+    # loses coverage of the omitted items.
+    filtered: bool = False
     results: List[ItemResult] = field(default_factory=list)
 
     @property
@@ -130,6 +190,28 @@ def load_dataset(dataset_dir: Optional[Path] = None) -> List[BenchItem]:
     return items
 
 
+def _token_in_text(token: str, text: str) -> bool:
+    """Case-insensitive any-of token match on WORD BOUNDARIES (#506).
+
+    A bare substring test (the old behaviour) false-positives: ``"major"``
+    matched ``"majority"``, ``"66"`` matched ``"1966"`` — a wrong answer could
+    pass the envelope, silently weakening the drift guard. We anchor with ``\\b``
+    only at edges adjacent to a word character, so punctuation-only tokens
+    (``"?"``) and dotted tokens (``"os.system"``) still match by presence
+    without an impossible boundary. ``text`` is expected pre-lowercased.
+    """
+    t = token.lower()
+    if not t:
+        return False
+    # Lookarounds instead of \b so tokens whose edge char is non-word
+    # (``"?"``, ``"c++"``) are still bounded correctly: require no word char
+    # immediately adjacent on either side. \b would silently drop the boundary
+    # on a punctuation edge, letting ``"c++"`` match inside ``"c++abc"``.
+    return (
+        re.search(r"(?<!\w)" + re.escape(t) + r"(?!\w)", text) is not None
+    )
+
+
 def check_envelope(
     item: BenchItem,
     synthesis: str,
@@ -141,7 +223,7 @@ def check_envelope(
     text = (synthesis or "").lower()
     for group in item.envelope.get("must_contain", []):
         options = group if isinstance(group, list) else [group]
-        if not any(str(opt).lower() in text for opt in options):
+        if not any(_token_in_text(str(opt), text) for opt in options):
             failures.append(f"missing_any_of:{options}")
     min_score = item.envelope.get("min_score")
     if min_score is not None and apply_score_floor:
@@ -163,13 +245,25 @@ def month_to_date_spend(runs_dir: Optional[Path] = None) -> float:
         for f in directory.glob("*.json"):
             try:
                 data = json.loads(f.read_text())
-                if str(data.get("started_at", "")).startswith(prefix):
-                    total += max(
-                        float(data.get("total_cost_usd", 0.0)),
-                        float(data.get("cap_charged_usd", 0.0)),
-                    )
-            except Exception:
+            except (OSError, ValueError) as exc:
+                # A corrupt/unreadable artefact must NOT silently drop its spend
+                # from a financial guard (that fails open, under-counting the
+                # month-to-date total). Surface it loudly so the gap is visible
+                # and actionable rather than invisible.
+                logger.warning("bench: skipping unreadable run artefact %s: %s", f.name, exc)
                 continue
+            if not str(data.get("started_at", "")).startswith(prefix):
+                continue
+            # The guard sums cap_charged_usd (actuals + conservative unknown-cost
+            # charges); fall back to total_cost_usd for pre-field artefacts. Guard
+            # non-numeric/null values rather than crashing the whole tally.
+            raw = data.get("cap_charged_usd")
+            if raw is None:
+                raw = data.get("total_cost_usd", 0.0)
+            try:
+                total += float(raw)
+            except (TypeError, ValueError):
+                logger.warning("bench: non-numeric spend in run artefact %s", f.name)
     except OSError:
         pass
     return total
@@ -212,6 +306,15 @@ async def run_bench(
     items = load_dataset(dataset_dir)
     if items_filter:
         wanted = set(items_filter)
+        known = {i.id for i in items}
+        unknown = sorted(wanted - known)
+        if unknown:
+            # A typo'd / stale --items id must not silently drop to a green
+            # "0/0 within envelope" run (#508). Fail loudly.
+            raise ValueError(
+                f"unknown --items id(s): {', '.join(unknown)}. "
+                f"Available: {', '.join(sorted(known))}"
+            )
         items = [i for i in items if i.id in wanted]
 
     run = BenchRun(
@@ -221,16 +324,8 @@ async def run_bench(
         items_passed=0,
         total_cost_usd=0.0,
         cost_known=False,
+        filtered=bool(items_filter),
     )
-
-    mtd = month_to_date_spend(runs_dir)
-    if mtd >= monthly_cap:
-        run.aborted = (
-            f"monthly_guard: month-to-date bench spend ${mtd:.2f} >= "
-            f"${monthly_cap:.2f} (LLM_COUNCIL_BENCH_MONTHLY_USD)"
-        )
-        _persist_run(run, runs_dir)
-        return run
 
     if council_runner is None:
         from llm_council.council import run_council_with_fallback
@@ -238,6 +333,32 @@ async def run_bench(
         async def council_runner(prompt: str) -> Dict[str, Any]:  # pragma: no cover
             return await run_council_with_fallback(prompt, bypass_cache=True)
 
+    resolved_runs_dir = runs_dir if runs_dir is not None else DEFAULT_RUNS_DIR
+    # Hold the monthly-guard lock across check-through-persist (#516): without
+    # this, two concurrent invocations can both read the same month-to-date
+    # spend, both pass the guard, then both write — jointly exceeding the cap.
+    async with _monthly_guard_lock(resolved_runs_dir):
+        mtd = month_to_date_spend(runs_dir)
+        if mtd >= monthly_cap:
+            run.aborted = (
+                f"monthly_guard: month-to-date bench spend ${mtd:.2f} >= "
+                f"${monthly_cap:.2f} (LLM_COUNCIL_BENCH_MONTHLY_USD)"
+            )
+            _persist_run(run, runs_dir)
+            return run
+        return await _run_items(run, items, council_runner, cap, runs_dir, ignore_score_floor)
+
+
+async def _run_items(
+    run: "BenchRun",
+    items: List[BenchItem],
+    council_runner: Any,
+    cap: float,
+    runs_dir: Optional[Path],
+    ignore_score_floor: bool,
+) -> "BenchRun":
+    """Execute the per-item loop and persist (split out of run_bench so the
+    monthly-guard lock in run_bench wraps this whole section, #516)."""
     # Cap accounting = actuals + conservative charges for unknown-cost items.
     # NOTE (by design): the cap is checked BETWEEN items, never mid-item —
     # a single item may overshoot; the abort is graceful, not mid-completion.
@@ -299,9 +420,26 @@ async def run_bench(
             )
         )
 
+    # An empty run (no items in the dataset, or every requested id filtered out)
+    # must NOT read as a green exit-0 that set_baseline would then accept as the
+    # reference — mark it aborted so exit is 2 and baselining refuses it (#508).
+    if run.items_run == 0 and run.aborted is None:
+        run.aborted = "no_items: 0 items ran (empty dataset or filter)"
+    # The between-item cap check never sees an overshoot caused by the FINAL
+    # item (the loop just ends), so a run pushed over cap on its last item used
+    # to complete as a silent exit-0. A run that reached its spend ceiling is an
+    # aborted/partial outcome — record it so the breach is never silent (#510).
+    if run.aborted is None and cap_charged >= cap:
+        run.aborted = (
+            f"per_run_cap: charged spend ${cap_charged:.2f} >= ${cap:.2f} "
+            f"(LLM_COUNCIL_BENCH_MAX_USD; actuals ${run.total_cost_usd:.2f} + "
+            f"unknown-cost charges) reached on the final item "
+            f"({run.items_run}/{run.items_total} items)"
+        )
     # 'fully known' means EVERY executed item reported a cost (#439 r2).
     run.cost_known = run.items_run > 0 and not any_unknown
     run.cap_charged_usd = cap_charged
+    run.cap_usd = cap
     _persist_run(run, runs_dir)
     return run
 
@@ -311,10 +449,16 @@ def _persist_run(run: BenchRun, runs_dir: Optional[Path] = None) -> None:
     directory = runs_dir if runs_dir is not None else DEFAULT_RUNS_DIR
     try:
         directory.mkdir(parents=True, exist_ok=True)
-        stamp = run.started_at.replace(":", "-").split(".")[0]
+        # Keep microseconds and add the pid: a whole-second stamp collided so
+        # two runs in the same second (e.g. `bench matrix` running configs
+        # sequentially) wrote the same file — the second overwrote the first and
+        # its spend vanished from the monthly ledger this feeds (#510).
+        stamp = run.started_at.replace(":", "-").replace("+", "-")
         payload = asdict(run)
         payload["exit_code"] = run.exit_code
-        (directory / f"run-{stamp}.json").write_text(json.dumps(payload, indent=2))
+        (directory / f"run-{stamp}-{os.getpid()}.json").write_text(
+            json.dumps(payload, indent=2)
+        )
     except Exception as exc:
         logger.warning("bench run artefact not persisted (%s)", exc)
 
@@ -323,10 +467,19 @@ def set_baseline(run: BenchRun, baseline_path: Optional[Path] = None) -> Path:
     """Snapshot the run as the committed baseline.
 
     Refuses aborted/partial runs (#439 r3): a truncated run would bake an
-    artificially narrow item set into the drift reference.
+    artificially narrow item set into the drift reference. Also refuses a
+    ``--items``-filtered run (#517): baselining a subset silently shrinks
+    coverage — the omitted items vanish from the drift reference and future
+    regressions on them go undetected.
     """
     if run.aborted:
         raise ValueError(f"refusing to baseline an aborted run: {run.aborted}")
+    if run.filtered:
+        raise ValueError(
+            "refusing to baseline a --items-filtered run "
+            f"({run.items_run}/{run.items_total} items) — baseline against "
+            "the full dataset so coverage never silently shrinks"
+        )
     path = baseline_path if baseline_path is not None else DEFAULT_BASELINE_PATH
     path.parent.mkdir(parents=True, exist_ok=True)
     payload = {
@@ -349,8 +502,13 @@ def compare_to_baseline(
     path = baseline_path if baseline_path is not None else DEFAULT_BASELINE_PATH
     try:
         baseline = json.loads(path.read_text())
-    except (OSError, json.JSONDecodeError):
-        # Absent OR corrupt baseline (#439 review): report, never crash.
+    except OSError:
+        return {"baseline": None}  # no baseline committed yet — expected, silent
+    except json.JSONDecodeError as exc:
+        # Corrupt baseline is NOT the same as "no baseline yet" — a silently
+        # identical report for both hides real corruption from the operator
+        # (round-5 review, same shape as #509's month_to_date_spend fix).
+        logger.warning("bench: baseline file %s is corrupt: %s", path, exc)
         return {"baseline": None}
     regressions = []
     for r in run.results:
@@ -378,7 +536,9 @@ def format_report(run: BenchRun, comparison: Dict[str, Any], fmt: str = "md") ->
         f"(of {run.items_total} selected) — exit code {run.exit_code}"
     )
     cost = f"${run.total_cost_usd:.4f}" if run.cost_known else f"~${run.total_cost_usd:.4f} (cost not fully known)"
-    lines.append(f"Spend: {cost} (per-run cap ${bench_max_usd():.2f})")
+    # Show the EFFECTIVE cap (a --max-usd override), not the env default (#509).
+    effective_cap = run.cap_usd if run.cap_usd is not None else bench_max_usd()
+    lines.append(f"Spend: {cost} (per-run cap ${effective_cap:.2f})")
     if run.aborted:
         lines.append(f"ABORTED (partial results): {run.aborted}")
     if comparison.get("baseline"):
