@@ -9,7 +9,7 @@ import time
 from typing import TYPE_CHECKING, List, Dict, Any, Optional, Callable, Awaitable
 
 # ADR-032: Migrated to unified_config
-from llm_council.unified_config import get_api_key, get_config
+from llm_council.unified_config import get_api_key
 
 from llm_council.gateway.resolver import resolve_endpoint, resolve_model_name
 

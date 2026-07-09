@@ -31,7 +31,15 @@ def resolve_endpoint() -> Tuple[str, str, str]:
         key = get_api_key("requesty") or (provider.api_key or "")
         return url, key, "requesty"
 
-    return OPENROUTER_API_URL, get_api_key("openrouter") or "", "openrouter"
+    # Check if openrouter provider is configured with custom settings
+    openrouter_provider = providers.get("openrouter")
+    if openrouter_provider is not None:
+        url = openrouter_provider.base_url or OPENROUTER_API_URL
+        key = get_api_key("openrouter") or (openrouter_provider.api_key or "")
+    else:
+        url = OPENROUTER_API_URL
+        key = get_api_key("openrouter") or ""
+    return url, key, "openrouter"
 
 
 def resolve_model_name(model: str, route: str) -> str:
@@ -42,9 +50,9 @@ def resolve_model_name(model: str, route: str) -> str:
     A per-gateway model_name_map in config rewrites ids; unknown ids pass
     through unchanged.
     """
-    if route == "requesty":
+    if route:
         config = get_config()
-        mapping = (config.gateways.model_name_map or {}).get("requesty", {})
+        mapping = (config.gateways.model_name_map or {}).get(route, {})
         if mapping:
             return mapping.get(model, model)
     return model
